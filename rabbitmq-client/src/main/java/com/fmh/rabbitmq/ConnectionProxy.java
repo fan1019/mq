@@ -44,7 +44,11 @@ public class ConnectionProxy implements InvocationHandler {
         return target;
     }
 
-
+    protected void removeCloseChannel(final ChannelProxy channelProxy){
+        synchronized (channelProxies){
+            channelProxies.remove(channelProxy);
+        }
+    }
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {

@@ -2,6 +2,9 @@ package com.fmh.rabbitmq;
 
 import com.fmh.rabbitmq.client.BooleanReentrantLatch;
 import com.fmh.rabbitmq.retry.RetryStrategy;
+import com.fmh.rabbitmq.util.InvocationHandlerUtils;
+import com.fmh.rabbitmq.util.Utils;
+import com.rabbitmq.client.AlreadyClosedException;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Consumer;
 import org.slf4j.Logger;
@@ -63,20 +66,72 @@ public class ChannelProxy implements InvocationHandler {
 
         for (int numOperationInvocations = 1; keepOnInvoking && shutdownRecoverable; numOperationInvocations++) {
             synchronized (target) {
-                if (method.getName().equals(BASIC_CONSUME)) {
-                    Consumer targetConsumer = (Consumer) args[args.length - 1];
-                    if (!(targetConsumer instanceof ConsumerProxy)) {
-                        ConsumerProxy consumerProxy = consumerProxies.get(targetConsumer);
-                        if (consumerProxy == null) {
-                            consumerProxy = new ConsumerProxy(targetConsumer, this, method, args);
+                try {
+                    if (method.getName().equals(BASIC_CONSUME)) {
+                        Consumer targetConsumer = (Consumer) args[args.length - 1];
+                        if (!(targetConsumer instanceof ConsumerProxy)) {
+                            ConsumerProxy consumerProxy = consumerProxies.get(targetConsumer);
+                            if (consumerProxy == null) {
+                                consumerProxy = new ConsumerProxy(targetConsumer, this, method, args);
+                            }
+                            ConsumerProxy existingConsumerProxy = consumerProxies.putIfAbsent(targetConsumer, consumerProxy);
+                            args[args.length - 1] = existingConsumerProxy == null ? consumerProxy : existingConsumerProxy;
                         }
-                        ConsumerProxy existingConsumerProxy = consumerProxies.putIfAbsent(targetConsumer, consumerProxy);
-                        args[args.length - 1] = existingConsumerProxy == null ? consumerProxy : existingConsumerProxy;
                     }
+                    return InvocationHandlerUtils.delegateMethodInvocation(method, args, target);
+                } catch (IOException ioe) {
+                    lastException = ioe;
+                    shutdownRecoverable = Utils.isShutdownRecoverable(ioe);
+                } catch (AlreadyClosedException ace) {
+                    lastException = ace;
+                    shutdownRecoverable = Utils.isShutdownRecoverable(ace);
+                } catch (Throwable t) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("catch all", t);
+                    }
+                    throw t;
                 }
-                return Invoc
+
+            }
+            if (shutdownRecoverable) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Invocation failed, calling retry strategy: " + lastException.getMessage());
+                }
+                keepOnInvoking = retryStrategy.shouldRetry(lastException, numOperationInvocations, connectionLatch);
             }
         }
-        return null;
+        if (shutdownRecoverable) {
+            logger.warn("Operation invocation failed after retry strategy gave up", lastException);
+        } else {
+            logger.warn("Operation invocation failed with unrecoverable shutdown signal", lastException);
+        }
+        throw lastException;
+    }
+
+    public Channel getTargetChannel() {
+        return target;
+    }
+
+    protected void markAsClosed() {
+        connectionLatch.close();
+    }
+
+    protected void markAsOpen() {
+        connectionLatch.open();
+    }
+
+    protected void setTargetChannel(final Channel target) {
+        assert target != null;
+
+        if (logger.isDebugEnabled() && target != null) {
+            logger.debug("Replacing channel: channel=" + this.target.toString());
+        }
+
+        synchronized (this.target) {
+            this.target = target;
+            if (logger.isDebugEnabled() && this.target != null) {
+                logger.debug("Replacing channel: channel=" + this.target.toString());
+            }
+        }
     }
 }
